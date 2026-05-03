@@ -2,7 +2,12 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 import tempfile
 import os
+import sys
 import shutil
+
+# Add api folder to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from generate_mvr import read_excel, build
 
 app = FastAPI()
@@ -10,7 +15,7 @@ app = FastAPI()
 TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaigan_template.docx")
 
 @app.post("/generate_mvr")
-async def generate_mvr(excel_file: UploadFile = File(...)):
+async def generate_report(excel_file: UploadFile = File(...)):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as f:
         shutil.copyfileobj(excel_file.file, f)
         excel_path = f.name
