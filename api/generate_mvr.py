@@ -1,7 +1,7 @@
 """
-generate_mvr_v2.py
+generate_mvr_v3.py
 Fills the approved Shaigan MVR template with data from Excel.
-Usage: python generate_mvr_v2.py <excel.xlsx> [output.docx]
+Usage: python generate_mvr_v3.py <excel.xlsx> [output.docx]
 Requires approved_file.docx in the same folder.
 """
 from docx.shared import Inches
@@ -53,7 +53,6 @@ def replace_in_para(para, old, new):
     if old not in full:
         return False
     new_full = full.replace(old, str(new))
-    # Put all text in first run, clear the rest
     if para.runs:
         para.runs[0].text = new_full
         for r in para.runs[1:]:
@@ -70,18 +69,14 @@ def replace_bold_in_cell(cell, old_text, new_text):
         full = "".join(r.text for r in para.runs)
         if old_text not in full:
             continue
-        # Split text around the target
         parts = full.split(old_text)
-        # Clear all existing runs
         p_el = para._p
         for r in para.runs:
             p_el.remove(r._r)
-        # Rebuild with bold for new_text portions
 
         def make_run(text, bold=False):
             r_el = etree.SubElement(p_el, f'{{{W}}}r')
             rpr = etree.SubElement(r_el, f'{{{W}}}rPr')
-            # Copy existing rPr properties if available - skip for simplicity
             sz = etree.SubElement(rpr, f'{{{W}}}sz')
             sz.set(f'{{{W}}}val', '22')
             szcs = etree.SubElement(rpr, f'{{{W}}}szCs')
@@ -115,8 +110,7 @@ def replace_cell_text(cell, new_text, preserve_bold=None):
 
 
 def replace_tc(row, tc_idx, new_text, bold=None):
-    """Replace text in actual tc element by index using Run API (survives doc.save()).
-    Use for tables with merged/spanned cells like Robustness TBL[27]."""
+    """Replace text in actual tc element by index using Run API (survives doc.save())."""
     from docx.oxml.ns import qn as _qn
     from docx.text.run import Run
     tcs = row._tr.findall(_qn('w:tc'))
@@ -142,7 +136,6 @@ def cell_text(cell):
 
 
 def find_run_with(para, text):
-    """Find run containing text."""
     full = "".join(r.text for r in para.runs)
     return text in full
 
@@ -163,16 +156,25 @@ def read_excel(path):
     AI = str(info.get("Active Ingredient", ""))
     MVL = str(info.get("MVL Number", "") or "")
     MVER = str(info.get("MVER Number", "") or "")
-    TEST = str(info.get("Test", f"Assay of {AI}"))
+    TEST = f"Assay of {AI}"
     TP = str(info.get("Testing Procedure", ""))
     HID = str(info.get("HPLC ID", ""))
     WS = str(info.get("Working Standard", ""))
     BATCH = str(info.get("Batch #", ""))
     PUR = info.get("Purity", 99.66)
 
+    # For Product: read batch 2 and 3 from rows 12 and 13 by position
+    is_product = "p" in SMP or "product" in SMP
+    if is_product:
+        BATCH2 = str(wi.cell(row=12, column=2).value or "").strip()
+        BATCH3 = str(wi.cell(row=13, column=2).value or "").strip()
+        batches = [b for b in [BATCH, BATCH2, BATCH3] if b]
+        BATCH_STR = ", ".join(batches)
+    else:
+        BATCH_STR = BATCH
+
     # Determine report number and name token
     RPT_NO = MVL if MVL else MVER
-    # Name token: if SM -> Active Ingredient; if Product -> Product Name
     NAME = AI if ("sm" in SMP or "starting" in SMP) else PN
 
     ws = wb["Validation Data"]
@@ -208,7 +210,7 @@ def read_excel(path):
         elif a.startswith("8. Lin"):
             sec["chart"] = r
 
-    # System Suitability Day 1
+    # System Suitability
     d1_ar = sec["assay"] + 2
     d1 = {
         "areas": [cv(c, d1_ar) for c in range(2, 8)],
@@ -217,7 +219,7 @@ def read_excel(path):
         "rsd": fv(2, d1_ar+3, 2),
     }
 
-    # Linearity (averages per concentration)
+    # Linearity
     ls = sec["lin"] + 2
     lin = []
     conc_map = {80: 0.122, 90: 0.135, 100: 0.150, 110: 0.165, 120: 0.182}
@@ -241,12 +243,9 @@ def read_excel(path):
             "av_rec": fv(rc, as_+3, 2),
         })
 
-    # IP - read each analyst block by finding their start rows
-    ip_start = sec["ip"] + 2  # first data row after header
+    # IP
+    ip_start = sec["ip"] + 2
     ip = []
-    # Analyst 1 Day 1: rows ip_start to ip_start+5
-    # Analyst 2 Day 1: rows ip_start+7 to ip_start+12
-    # Analyst 1 Day 2: rows ip_start+14 to ip_start+19
     for offset in [0, 7, 14]:
         r0 = ip_start + offset
         ip.append({
@@ -261,10 +260,10 @@ def read_excel(path):
     deg = []
     for name in ["Acid Degradation", "Base Degradation", "H\u2082O\u2082 Degradation"]:
         deg.append({
-            "name":   name,
-            "areas":  [cv(3, ds+i) for i in range(2)],
+            "name":    name,
+            "areas":   [cv(3, ds+i) for i in range(2)],
             "results": [fv(4, ds+i, 2) for i in range(2)],
-            "av_r":   fv(6, ds, 2),
+            "av_r":    fv(6, ds, 2),
         })
         ds += 3
 
@@ -292,13 +291,13 @@ def read_excel(path):
         "area": fv(4, lr+1, 0),
     }
 
-    # Linearity chart data
     chart_concs = [l["conc"] for l in lin]
     chart_areas = [l["av"] for l in lin]
 
     return dict(
-        PN=PN, AI=AI, NAME=NAME, RPT_NO=RPT_NO,
-        TEST=TEST, TP=TP, HID=HID, WS=WS, BATCH=BATCH, PUR=PUR,
+        PN=PN, AI=AI, NAME=NAME, RPT_NO=RPT_NO, SMP=SMP,
+        TEST=TEST, TP=TP, HID=HID, WS=WS,
+        BATCH=BATCH, BATCH_STR=BATCH_STR, PUR=PUR,
         d1=d1, lin=lin, acc=acc, ip=ip, deg=deg, rob=rob,
         lod=lod, loq=loq,
         chart_concs=chart_concs, chart_areas=chart_areas,
@@ -312,7 +311,9 @@ def fill_template(data, template, output):
     doc = Document(output)
 
     AI = data["AI"]
+    PN = data["PN"]
     NAME = data["NAME"]
+    SMP = data["SMP"]
     RPT = data["RPT_NO"]
     d1 = data["d1"]
     lin = data["lin"]
@@ -322,57 +323,55 @@ def fill_template(data, template, output):
     rob = data["rob"]
     lod = data["lod"]
     loq = data["loq"]
+    is_product = "p" in SMP or "product" in SMP
 
     body = doc.element.body
     tbls = doc.tables
     paras = doc.paragraphs
 
-    # ── P[001]: Report No ──────────────────────────────────────────────────
+    # ── P[001]: Report No ─────────────────────────────────────────────────
     for p in paras:
         if "Method Validation Report No:" in p.text:
             replace_in_para(p, "MVL-524", RPT)
             break
 
-    # ── TBL[002]: Cover info table ─────────────────────────────────────────
-    # rows: AI | value | Test | value
-    #       Testing Procedure | value | SOP Followed | 3/QC/GEN/012
+    # ── TBL[002]: Cover info table ────────────────────────────────────────
     tbl_cover = tbls[0]
-    replace_cell_text(tbl_cover.cell(0, 1), data["AI"])
+    replace_cell_text(tbl_cover.cell(0, 1), AI)
     replace_cell_text(tbl_cover.cell(0, 3), data["TEST"])
     replace_cell_text(tbl_cover.cell(1, 1), data["TP"])
 
-    # ── TBL[022]: Pre-verification ─────────────────────────────────────────
-    # Single cell with all text - find runs containing dynamic values
+    # ── TBL[022]: Pre-verification ────────────────────────────────────────
     tbl_pre = tbls[2]
     cell_pre = tbl_pre.cell(0, 0)
     for para in cell_pre.paragraphs:
         full = "".join(r.text for r in para.runs)
         if "HPLC" in full and "QC-" in full:
-            # Replace HPLC ID
             new_full = re.sub(r'HPLC\s+\S+', f'HPLC {data["HID"]}', full)
             if para.runs:
                 para.runs[0].text = new_full
                 for r in para.runs[1:]:
                     r.text = ""
         elif "Working Standard #" in full:
-            # Write AI bold + rest normal
             replace_bold_in_cell(cell_pre, "Avanafil Working Standard # CPL/WS/25/AVN/038",
                                  f"{AI} Working Standard # {data['WS']}")
-            break
+            # NO break — continue to reach batch line
         elif "Starting Material B #" in full:
-            replace_bold_in_cell(cell_pre, "Avanafil Starting Material B # 15048002-AVN",
-                                 f"{AI} Starting Material B # {data['BATCH']}")
+            if is_product:
+                replace_bold_in_cell(cell_pre, "Avanafil Starting Material B # 15048002-AVN",
+                                     f"{PN} Batch # {data['BATCH_STR']}")
+            else:
+                replace_bold_in_cell(cell_pre, "Avanafil Starting Material B # 15048002-AVN",
+                                     f"{AI} Starting Material B # {data['BATCH_STR']}")
             break
 
-    # ── TBL[038]: Linearity data ───────────────────────────────────────────
-    # rows 1-5: 80,90,100,110,120 | conc | peak area
+    # ── TBL[038]: Linearity data ──────────────────────────────────────────
     tbl_lin = tbls[7]
     for i, lv in enumerate(lin):
         row = tbl_lin.rows[i+1]
         replace_cell_text(row.cells[2], fmt0(lv["av"]))
 
-    # ── Accuracy tables ────────────────────────────────────────────────────
-    # TBL[056]=Sample I, TBL[059]=Sample II, TBL[062]=Sample III
+    # ── Accuracy tables ───────────────────────────────────────────────────
     acc_tbls = [tbls[11], tbls[12], tbls[13]]
     for idx, lvl in enumerate(acc):
         t = acc_tbls[idx]
@@ -383,28 +382,25 @@ def fill_template(data, template, output):
                 replace_cell_text(row.cells[3], fmt(lvl["rsd"], 2))
             replace_cell_text(row.cells[4], fmt(lvl["recs"][i], 2))
 
-    # ── TBL[065]: Grand average ────────────────────────────────────────────
+    # ── TBL[065]: Grand average ───────────────────────────────────────────
     tbl_gav = tbls[14]
-    bounds = {80: ("78", "82"), 100: ("98", "102"), 120: ("118", "122")}
     for i, lvl in enumerate(acc):
         row = tbl_gav.rows[i+1]
         replace_cell_text(row.cells[1], f"{lvl['av_rec']}%")
 
-    # ── TBL[077]: Precision Repeatability ─────────────────────────────────
+    # ── TBL[077]: Precision Repeatability ────────────────────────────────
     tbl_rep = tbls[17]
     for i, area in enumerate(d1["areas"]):
-        tbl_rep.rows[i+1].cells[1]._element
         replace_cell_text(tbl_rep.rows[i+1].cells[1], fmt0(area))
     replace_cell_text(tbl_rep.rows[7].cells[1], fmt0(d1["av"]))
     replace_cell_text(tbl_rep.rows[8].cells[1], fmt(d1["sd"], 2))
     replace_cell_text(tbl_rep.rows[9].cells[1], fmt(d1["rsd"], 2))
 
-    # ── TBL[082]: Repeatability acceptance ────────────────────────────────
+    # ── TBL[082]: Repeatability acceptance ───────────────────────────────
     tbl_rep_acc = tbls[18]
     replace_cell_text(tbl_rep_acc.rows[1].cells[1], fmt(d1["rsd"], 2))
 
     # ── TBL[021]: Within Days ─────────────────────────────────────────────
-    # ip[0]=Analyst1 Day1, ip[2]=Analyst1 Day2
     tbl_wd = tbls[21]
     wd_data = [ip[0], ip[2]]
     day_lbls = ["Day 1", "Day 2"]
@@ -419,12 +415,12 @@ def fill_template(data, template, output):
             replace_cell_text(row.cells[4], fmt(ipd["rsd_r"], 2))
             row_idx += 1
 
-    # ── TBL[022]: Within Days acceptance ──────────────────────────────────
+    # ── TBL[022]: Within Days acceptance ─────────────────────────────────
     tbl_wd_acc = tbls[22]
     replace_cell_text(tbl_wd_acc.rows[1].cells[1], fmt(ip[0]["rsd_r"], 2))
     replace_cell_text(tbl_wd_acc.rows[2].cells[1], fmt(ip[2]["rsd_r"], 2))
 
-    # ── TBL[104]: By Different Analyst ────────────────────────────────────
+    # ── TBL[104]: By Different Analyst ───────────────────────────────────
     tbl_an = tbls[24]
     an_data = [ip[0], ip[1]]
     row_idx = 1
@@ -439,12 +435,12 @@ def fill_template(data, template, output):
             replace_cell_text(row.cells[2], fmt(ipd["results"][si], 2))
             row_idx += 1
 
-    # ── TBL[107]: By Analyst acceptance ───────────────────────────────────
+    # ── TBL[107]: By Analyst acceptance ──────────────────────────────────
     tbl_an_acc = tbls[25]
     replace_cell_text(tbl_an_acc.rows[1].cells[1], fmt(ip[0]["rsd_r"], 2))
     replace_cell_text(tbl_an_acc.rows[2].cells[1], fmt(ip[1]["rsd_r"], 2))
 
-    # ── TBL[027]: Robustness (merged cells — use replace_tc not cells[]) ────
+    # ── TBL[027]: Robustness (merged cells) ──────────────────────────────
     tbl_rob = tbls[27]
     for ri, r in enumerate(rob):
         std_row = tbl_rob.rows[ri*2 + 3]
@@ -456,7 +452,7 @@ def fill_template(data, template, output):
         replace_tc(spl_row, 1, fmt0(r["spl_a"]))
         replace_tc(spl_row, 2, "")
 
-    # ── TBL[122]: Forced Degradation ──────────────────────────────────────
+    # ── TBL[122]: Forced Degradation ─────────────────────────────────────
     tbl_deg = tbls[29]
     row_idx = 1
     for d in deg:
@@ -468,7 +464,7 @@ def fill_template(data, template, output):
                 replace_cell_text(row.cells[3], fmt(d["av_r"], 2))
             row_idx += 1
 
-    # ── TBL[136]: LOD ─────────────────────────────────────────────────────
+    # ── TBL[136]: LOD ────────────────────────────────────────────────────
     tbl_lod = tbls[32]
     lin_concs = [(l["pct"], l["conc"], l["av"]) for l in lin]
     for i, (pct, conc, av) in enumerate(lin_concs):
@@ -483,7 +479,7 @@ def fill_template(data, template, output):
             replace_cell_text(row.cells[6], fmt(lod["ug"], 2))
             replace_cell_text(row.cells[7], fmt0(lod["area"]))
 
-    # ── TBL[153]: LOQ ─────────────────────────────────────────────────────
+    # ── TBL[153]: LOQ ────────────────────────────────────────────────────
     tbl_loq = tbls[35]
     for i, (pct, conc, av) in enumerate(lin_concs):
         row = tbl_loq.rows[i+2]
@@ -499,8 +495,7 @@ def fill_template(data, template, output):
 
     # ── TBL[039]: Specificity result ──────────────────────────────────────
     tbl_spec = tbls[39]
-    cell_result = tbl_spec.rows[1].cells[1]
-    replace_bold_in_cell(cell_result, "Avanafil", AI)
+    replace_bold_in_cell(tbl_spec.rows[1].cells[1], "Avanafil", AI)
 
     # ── TBL[040]: Observation ─────────────────────────────────────────────
     tbl_obs = tbls[40]
@@ -508,18 +503,56 @@ def fill_template(data, template, output):
 
     # ── TBL[043]: Conclusion + Statement ──────────────────────────────────
     tbl_con = tbls[43]
-    # Row 1: conclusion - replace "Avanafil Starting Material" as a phrase then "Avanafil" alone
     con_cell = tbl_con.rows[1].cells[0]
     for para in con_cell.paragraphs:
         full = "".join(r.text for r in para.runs)
         if "Avanafil Starting Material" in full:
-            replace_bold_in_cell(
-                con_cell, "Avanafil Starting Material", f"{NAME} Starting Material")
-        elif "Avanafil" in full:
-            replace_bold_in_cell(con_cell, "Avanafil", NAME)
-    # Row 3: statement of suitability
+            if is_product:
+                replace_bold_in_cell(
+                    con_cell, "Avanafil Starting Material", PN)
+            else:
+                replace_bold_in_cell(
+                    con_cell, "Avanafil Starting Material", f"{AI} Starting Material")
+
+   # Statement of Suitability — both occurrences in one pass
     stmt_cell = tbl_con.rows[3].cells[0]
-    replace_bold_in_cell(stmt_cell, "Avanafil", AI)
+    stmt_name = PN if is_product else AI
+    for para in stmt_cell.paragraphs:
+        full = "".join(r.text for r in para.runs)
+        if "determination of Avanafil" in full and "quantification of Avanafil" in full:
+            from lxml import etree
+            W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+            p_el = para._p
+            for r in para.runs:
+                p_el.remove(r._r)
+            part1, rest = full.split("determination of Avanafil", 1)
+            part2, part3 = rest.split("quantification of Avanafil", 1)
+
+            def make_run(text, bold=False):
+                r_el = etree.SubElement(p_el, f'{{{W}}}r')
+                rpr = etree.SubElement(r_el, f'{{{W}}}rPr')
+                sz = etree.SubElement(rpr, f'{{{W}}}sz')
+                sz.set(f'{{{W}}}val', '22')
+                szcs = etree.SubElement(rpr, f'{{{W}}}szCs')
+                szcs.set(f'{{{W}}}val', '22')
+                if bold:
+                    etree.SubElement(rpr, f'{{{W}}}b')
+                    etree.SubElement(rpr, f'{{{W}}}bCs')
+                t_el = etree.SubElement(r_el, f'{{{W}}}t')
+                t_el.text = text
+                t_el.set(
+                    '{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+
+            if part1:
+                make_run(part1)
+            make_run("determination of ", False)
+            make_run(AI, True)
+            if part2:
+                make_run(part2)
+            make_run("quantification of ", False)
+            make_run(stmt_name, True)
+            if part3:
+                make_run(part3)
 
     # ── Generate and insert linearity chart ───────────────────────────────
     try:
@@ -538,42 +571,30 @@ def _insert_chart(doc, data):
     AI = data["AI"]
     lin = data["lin"]
 
-    # X = percentage concentrations, Y = average peak areas
-    x = [l["pct"] for l in lin]        # [80, 90, 100, 110, 120]
-    y = [float(l["av"]) for l in lin]  # average peak areas
+    x = [l["pct"] for l in lin]
+    y = [float(l["av"]) for l in lin]
 
-    # Chart size in inches (from approved_file.docx EMU values)
-    # cx=4924425 EMU, cy=2762250 EMU — 1 inch = 914400 EMU
-    width_in = 4924425 / 914400   # 5.385 inches
-    height_in = 2762250 / 914400   # 3.020 inches
+    width_in = 4924425 / 914400
+    height_in = 2762250 / 914400
 
-    # ── Draw chart — matches Avanafil original exactly ────────────────────
     plt.rcParams.update({'font.family': 'Calibri'})
     fig, ax = plt.subplots(figsize=(width_in, height_in), dpi=150)
     fig.patch.set_facecolor('white')
     ax.set_facecolor('white')
 
-    # Trendline — blue, thin
     coeffs = np.polyfit(x, y, 1)
     trendline = np.poly1d(coeffs)
     x_line = np.linspace(min(x), max(x), 500)
     ax.plot(x_line, trendline(x_line), color='#4472C4', linewidth=1.2)
-
-    # Tiny scatter dots on data points
     ax.scatter(x, y, color='#4472C4', s=8, zorder=3, linewidths=0)
 
-    # Title
     ax.set_title(AI, fontsize=11, fontweight='normal', pad=8)
-
-    # Axis labels
     ax.set_xlabel("Concentration (%)", fontsize=10)
     ax.set_ylabel("Peak Area", fontsize=10)
 
-    # X axis: 60 to 140, step 10
     ax.set_xlim(60, 140)
     ax.set_xticks(range(60, 141, 10))
 
-    # Y axis: always start at 4000000, step 1000000
     y_max = max(y)
     y_top = int(np.ceil((y_max + 500000) / 1000000)) * 1000000
     ax.set_ylim(4000000, y_top)
@@ -581,14 +602,9 @@ def _insert_chart(doc, data):
     ax.yaxis.set_major_formatter(
         plt.FuncFormatter(lambda val, _: f'{int(val)}'))
 
-    # Tick params
     ax.tick_params(axis='both', labelsize=8, width=0.4, length=3)
-
-    # Grid — light grey, thin
     ax.grid(True, which='major', color='#C0C0C0', linewidth=0.4, linestyle='-')
     ax.set_axisbelow(True)
-
-    # Spines — very thin, matching Excel default
     for spine in ax.spines.values():
         spine.set_linewidth(0.4)
         spine.set_color('black')
@@ -596,27 +612,17 @@ def _insert_chart(doc, data):
 
     fig.tight_layout(pad=0.8)
 
-    # Save to temp PNG
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     tmp_path = tmp.name
     tmp.close()
     fig.savefig(tmp_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
 
-    # ── Find and replace chart in document XML ────────────────────────────
     body = doc.element.body
     C = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
-
-    # Search entire body XML for any element containing a chart reference
-    chart_drawing = None
-    all_drawings = body.findall(
-        f'.//{{{qn("w:drawing").split("}")[0].strip("{")}}}'
-        f'w:drawing',
-        {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-    )
-
-    # Simpler: iterate all elements in body looking for w:drawing
     W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    chart_drawing = None
     for drawing in body.iter(f'{{{W}}}drawing'):
         for el in drawing.iter():
             if el.tag == f'{{{C}}}chart':
@@ -625,14 +631,11 @@ def _insert_chart(doc, data):
         if chart_drawing is not None:
             break
 
-    print(f"Chart drawing found: {chart_drawing is not None}")
-
     if chart_drawing is None:
         print("Warning: chart drawing not found in document")
         os.unlink(tmp_path)
         return
 
-    # Add image to document part and get relationship id
     from docx.opc.constants import RELATIONSHIP_TYPE as RT
     from docx.parts.image import ImagePart
     from docx.image.image import Image as DocxImage
@@ -650,11 +653,9 @@ def _insert_chart(doc, data):
     )
     rId = doc.part.relate_to(image_part, RT.IMAGE)
 
-    # EMU dimensions (exact match to original chart)
     cx = 4924425
     cy = 2762250
 
-    # Build inline image XML
     img_xml = f'''<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
              distT="0" distB="0" distL="0" distR="0">
@@ -684,8 +685,6 @@ def _insert_chart(doc, data):
 </w:drawing>'''
 
     new_drawing = etree.fromstring(img_xml)
-
-    # Replace old chart drawing with new image drawing
     parent = chart_drawing.getparent()
     idx = list(parent).index(chart_drawing)
     parent.remove(chart_drawing)
@@ -696,7 +695,7 @@ def _insert_chart(doc, data):
 
 
 def _update_chart(doc, areas):
-    """Legacy — kept for reference, no longer called."""
+    """Legacy — no longer called."""
     pass
 
 
