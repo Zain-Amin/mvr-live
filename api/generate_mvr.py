@@ -4,15 +4,22 @@ Fills the approved Shaigan MVR template with data from Excel.
 Usage: python generate_mvr_v2.py <excel.xlsx> [output.docx]
 Requires approved_file.docx in the same folder.
 """
+from docx.shared import Inches
+from docx.oxml import parse_xml
+from docx.oxml.ns import qn
+from docx import Document
+import numpy as np
+import matplotlib.pyplot as plt
 import sys
 import shutil
 import os
 import copy
 import re
+import tempfile
+import zipfile
 import openpyxl
-from docx import Document
-from docx.oxml.ns import qn
-from docx.oxml import parse_xml
+import matplotlib
+matplotlib.use('Agg')
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -514,46 +521,183 @@ def fill_template(data, template, output):
     stmt_cell = tbl_con.rows[3].cells[0]
     replace_bold_in_cell(stmt_cell, "Avanafil", AI)
 
-    # ── Update chart data ──────────────────────────────────────────────────
-    # The chart XML is in word/charts/chart1.xml - update series values
+    # ── Generate and insert linearity chart ───────────────────────────────
     try:
-        _update_chart(doc, data["chart_areas"])
+        _insert_chart(doc, data)
     except Exception as e:
-        print(f"Warning: chart update failed: {e}")
+        print(f"Warning: chart insertion failed: {e}")
 
     doc.save(output)
     print(f"Saved: {output}")
 
 
-def _update_chart(doc, areas):
-    """Update the linearity chart with new area values."""
-    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+def _insert_chart(doc, data):
+    """Generate linearity chart using matplotlib and replace existing chart in DOCX."""
     from lxml import etree
 
-    # Find chart part
-    for rel in doc.part.rels.values():
-        if "chart" in rel.reltype.lower():
-            chart_part = rel.target_part
-            chart_xml = etree.fromstring(chart_part.blob)
-            ns = "http://schemas.openxmlformats.org/drawingml/2006/chart"
-            NS = f"{{{ns}}}"
+    AI = data["AI"]
+    lin = data["lin"]
 
-            # Find all numRef/numCache val elements and update
-            for ser in chart_xml.findall(f".//{NS}ser"):
-                # Update y values (peak area)
-                val_el = ser.find(f".//{NS}val")
-                if val_el is not None:
-                    cache = val_el.find(f".//{NS}numCache")
-                    if cache is not None:
-                        pts = cache.findall(f"{NS}pt")
-                        for i, pt in enumerate(pts):
-                            if i < len(areas):
-                                v = pt.find(f"{NS}v")
-                                if v is not None:
-                                    v.text = str(areas[i])
+    # X = percentage concentrations, Y = average peak areas
+    x = [l["pct"] for l in lin]        # [80, 90, 100, 110, 120]
+    y = [float(l["av"]) for l in lin]  # average peak areas
 
-            chart_part._blob = etree.tostring(chart_xml)
+    # Chart size in inches (from approved_file.docx EMU values)
+    # cx=4924425 EMU, cy=2762250 EMU — 1 inch = 914400 EMU
+    width_in = 4924425 / 914400   # 5.385 inches
+    height_in = 2762250 / 914400   # 3.020 inches
+
+    # ── Draw chart — matches Avanafil original exactly ────────────────────
+    plt.rcParams.update({'font.family': 'Calibri'})
+    fig, ax = plt.subplots(figsize=(width_in, height_in), dpi=150)
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white')
+
+    # Trendline — blue, thin
+    coeffs = np.polyfit(x, y, 1)
+    trendline = np.poly1d(coeffs)
+    x_line = np.linspace(min(x), max(x), 500)
+    ax.plot(x_line, trendline(x_line), color='#4472C4', linewidth=1.2)
+
+    # Tiny scatter dots on data points
+    ax.scatter(x, y, color='#4472C4', s=8, zorder=3, linewidths=0)
+
+    # Title
+    ax.set_title(AI, fontsize=11, fontweight='normal', pad=8)
+
+    # Axis labels
+    ax.set_xlabel("Concentration (%)", fontsize=10)
+    ax.set_ylabel("Peak Area", fontsize=10)
+
+    # X axis: 60 to 140, step 10
+    ax.set_xlim(60, 140)
+    ax.set_xticks(range(60, 141, 10))
+
+    # Y axis: always start at 4000000, step 1000000
+    y_max = max(y)
+    y_top = int(np.ceil((y_max + 500000) / 1000000)) * 1000000
+    ax.set_ylim(4000000, y_top)
+    ax.set_yticks(range(4000000, y_top + 1, 1000000))
+    ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda val, _: f'{int(val)}'))
+
+    # Tick params
+    ax.tick_params(axis='both', labelsize=8, width=0.4, length=3)
+
+    # Grid — light grey, thin
+    ax.grid(True, which='major', color='#C0C0C0', linewidth=0.4, linestyle='-')
+    ax.set_axisbelow(True)
+
+    # Spines — very thin, matching Excel default
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.4)
+        spine.set_color('black')
+        spine.set_visible(True)
+
+    fig.tight_layout(pad=0.8)
+
+    # Save to temp PNG
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    fig.savefig(tmp_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    # ── Find and replace chart in document XML ────────────────────────────
+    body = doc.element.body
+    C = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
+
+    # Search entire body XML for any element containing a chart reference
+    chart_drawing = None
+    all_drawings = body.findall(
+        f'.//{{{qn("w:drawing").split("}")[0].strip("{")}}}'
+        f'w:drawing',
+        {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    )
+
+    # Simpler: iterate all elements in body looking for w:drawing
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    for drawing in body.iter(f'{{{W}}}drawing'):
+        for el in drawing.iter():
+            if el.tag == f'{{{C}}}chart':
+                chart_drawing = drawing
+                break
+        if chart_drawing is not None:
             break
+
+    print(f"Chart drawing found: {chart_drawing is not None}")
+
+    if chart_drawing is None:
+        print("Warning: chart drawing not found in document")
+        os.unlink(tmp_path)
+        return
+
+    # Add image to document part and get relationship id
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.parts.image import ImagePart
+    from docx.image.image import Image as DocxImage
+    from docx.opc.packuri import PackURI
+
+    with open(tmp_path, 'rb') as f:
+        img_bytes = f.read()
+
+    image = DocxImage.from_file(tmp_path)
+    image_part = ImagePart(
+        PackURI('/word/media/chart_generated.png'),
+        'image/png',
+        img_bytes,
+        image
+    )
+    rId = doc.part.relate_to(image_part, RT.IMAGE)
+
+    # EMU dimensions (exact match to original chart)
+    cx = 4924425
+    cy = 2762250
+
+    # Build inline image XML
+    img_xml = f'''<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+             distT="0" distB="0" distL="0" distR="0">
+    <wp:extent cx="{cx}" cy="{cy}"/>
+    <wp:effectExtent l="0" t="0" r="0" b="0"/>
+    <wp:docPr id="1" name="Chart"/>
+    <wp:cNvGraphicFramePr/>
+    <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+      <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+        <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+          <pic:nvPicPr>
+            <pic:cNvPr id="1" name="Chart"/>
+            <pic:cNvPicPr/>
+          </pic:nvPicPr>
+          <pic:blipFill>
+            <a:blip r:embed="{rId}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>
+            <a:stretch><a:fillRect/></a:stretch>
+          </pic:blipFill>
+          <pic:spPr>
+            <a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>
+            <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+          </pic:spPr>
+        </pic:pic>
+      </a:graphicData>
+    </a:graphic>
+  </wp:inline>
+</w:drawing>'''
+
+    new_drawing = etree.fromstring(img_xml)
+
+    # Replace old chart drawing with new image drawing
+    parent = chart_drawing.getparent()
+    idx = list(parent).index(chart_drawing)
+    parent.remove(chart_drawing)
+    parent.insert(idx, new_drawing)
+
+    os.unlink(tmp_path)
+    print(f"Chart inserted: {AI}, {len(x)} points")
+
+
+def _update_chart(doc, areas):
+    """Legacy — kept for reference, no longer called."""
+    pass
 
 
 # ── Main ───────────────────────────────────────────────────────────────────
