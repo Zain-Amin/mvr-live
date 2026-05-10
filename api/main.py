@@ -1,7 +1,9 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse
 import tempfile
-import os
 import shutil
 from generate_mvr import read_excel, fill_template
 
